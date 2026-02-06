@@ -9,6 +9,8 @@ EXPOSE 8080
 # Copy the VLESS config into the container
 COPY config.json /etc/v2ray/config.json
 
+CMD ["v2ray", "run", "-config", "/etc/v2ray/config.json"]
+
 # Copy the reporter script
 COPY reporter.py /reporter.py
 
