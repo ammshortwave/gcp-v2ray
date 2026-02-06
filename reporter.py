@@ -5,6 +5,7 @@ import json
 import subprocess
 import urllib.request
 import urllib.error
+import shutil
 
 # Configuration
 # The UUID to use for both the Proxy User and the API Report
@@ -17,23 +18,33 @@ USER_EMAIL = "user@v2ray"
 
 # Paths
 ORIGINAL_CONFIG = "/etc/v2ray/config.json"
-RUNTIME_CONFIG = "/etc/v2ray/config_runtime.json"
+# Use /tmp to ensure write permissions in restrictive containers
+RUNTIME_CONFIG = "/tmp/config_runtime.json"
 
 def detect_binary():
-    if os.system("which xray > /dev/null 2>&1") == 0:
+    # Prefer Xray if present
+    if shutil.which("xray"):
         return "xray"
-    if os.system("which v2ctl > /dev/null 2>&1") == 0:
+    # Check for v2ctl (V2Ray v4)
+    if shutil.which("v2ctl"):
         return "v2ctl"
-    if os.system("which v2ray > /dev/null 2>&1") == 0:
+    # Fallback to v2ray (V2Ray v5 or v4)
+    if shutil.which("v2ray"):
         return "v2ray"
-    return "v2ray" # Default fallback
+    
+    print("Warning: No v2ray/xray/v2ctl binary found in PATH!")
+    return "v2ray"
 
 V2CTL = detect_binary()
 print(f"Using binary for API calls: {V2CTL}")
 
 def generate_runtime_config():
-    print("Generating runtime configuration...")
+    print(f"Generating runtime configuration at {RUNTIME_CONFIG}...")
     try:
+        if not os.path.exists(ORIGINAL_CONFIG):
+            print(f"Error: Original config not found at {ORIGINAL_CONFIG}")
+            return False
+
         with open(ORIGINAL_CONFIG, 'r') as f:
             config = json.load(f)
         
@@ -90,7 +101,6 @@ def generate_runtime_config():
         config["routing"]["rules"].insert(0, api_rule)
         
         # 6. Update User UUID in VLESS Inbound
-        # Find the vless inbound (usually the one with settings.clients)
         found = False
         for inbound in config["inbounds"]:
             if inbound.get("protocol") == "vless":
@@ -117,34 +127,61 @@ def generate_runtime_config():
 
 def run_v2ray():
     print("Starting V2Ray with runtime config...")
-    # Determine the executable (v2ray or xray)
-    # The Dockerfile uses 'v2ray' command usually, but let's check what's available
-    # The 'detect_binary' finds the tool for API, but the runner might be different.
-    # teddysun/v2ray image has 'v2ray' in path.
     
-    cmd = ["v2ray", "run", "-config", RUNTIME_CONFIG]
-    
-    # If xray is present (some images switch), use it
-    if os.system("which xray > /dev/null 2>&1") == 0:
+    # Determine execution command
+    cmd = []
+    if shutil.which("xray"):
         cmd = ["xray", "run", "-config", RUNTIME_CONFIG]
+    elif shutil.which("v2ray"):
+        # Check if v2ray supports 'run' (v5) or not (v4)
+        # We can try 'run' first. If it fails, fallback? 
+        # But subprocess.Popen won't tell us easily without trying.
+        # Assuming v5 based on 'teddysun/v2ray:latest' which is likely v5.
+        cmd = ["v2ray", "run", "-config", RUNTIME_CONFIG]
+    else:
+        print("Error: No v2ray executable found.")
+        sys.exit(1)
 
-    proc = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
-    return proc
+    print(f"Executing: {' '.join(cmd)}")
+    
+    # Forward stdout/stderr to container logs
+    try:
+        proc = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+        return proc
+    except Exception as e:
+        print(f"Failed to start V2Ray: {e}")
+        sys.exit(1)
 
 def api_call(method, request_json):
-    cmd = [V2CTL, "api", f"--server={V2RAY_API}", method]
-    process = subprocess.Popen(
-        cmd, 
-        stdin=subprocess.PIPE, 
-        stdout=subprocess.PIPE, 
-        stderr=subprocess.PIPE,
-        text=True
-    )
-    stdout, stderr = process.communicate(input=json.dumps(request_json))
-    if process.returncode != 0:
-        print(f"API Call Failed: {method}")
+    # Determine command structure based on detected binary
+    cmd = []
+    if V2CTL == "v2ctl":
+        # V4 style: v2ctl api --server=... Service.Method
+        cmd = ["v2ctl", "api", f"--server={V2RAY_API}", method]
+    elif V2CTL == "xray":
+         # Xray style: xray api --server=... Service.Method
+        cmd = ["xray", "api", f"--server={V2RAY_API}", method]
+    else:
+        # V5 style: v2ray api --server=... Service.Method
+        cmd = ["v2ray", "api", f"--server={V2RAY_API}", method]
+
+    try:
+        process = subprocess.Popen(
+            cmd, 
+            stdin=subprocess.PIPE, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        stdout, stderr = process.communicate(input=json.dumps(request_json))
+        if process.returncode != 0:
+            # Don't print error every time to avoid log spam if it's just starting up
+            # print(f"API Call Failed: {method}, Error: {stderr}")
+            return None
+        return stdout
+    except Exception as e:
+        print(f"API execution error: {e}")
         return None
-    return stdout
 
 def query_stats():
     # Query all stats
@@ -191,11 +228,12 @@ def main_loop():
         sys.exit(1)
         
     v2ray_proc = run_v2ray()
-    time.sleep(10) # Wait for startup
     
+    # Wait loop
     while True:
+        # Check if process is dead
         if v2ray_proc.poll() is not None:
-            print("V2Ray process exited!")
+            print(f"V2Ray process exited with code {v2ray_proc.returncode}!")
             sys.exit(1)
             
         stats = query_stats()
